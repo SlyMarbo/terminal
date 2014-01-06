@@ -113,3 +113,8 @@ func ReadPassword(fd int) ([]byte, error) {
 
 	return ret, nil
 }
+
+type ReadWriter struct {
+	io.Reader
+	io.Writer
+}

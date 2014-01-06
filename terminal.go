@@ -6,6 +6,7 @@ package terminal
 
 import (
 	"io"
+	"os"
 	"sync"
 )
 
@@ -46,6 +47,10 @@ type Terminal struct {
 	// may be empty if the terminal doesn't support them.
 	Escape *EscapeCodes
 
+	fds           [2]uintptr
+	reset         [2]*State
+	previousLines [][]byte
+
 	// lock protects the terminal and the state in this object from
 	// concurrent processing of a key press and a Write() call.
 	lock sync.Mutex
@@ -77,19 +82,53 @@ type Terminal struct {
 	inBuf     [256]byte
 }
 
-// NewTerminal runs a VT100 terminal on the given ReadWriter. If the ReadWriter is
-// a local terminal, that terminal must first have been put into raw mode.
+// NewTerminal runs a VT100 terminal on the given input and output.
 // prompt is a string that is written at the start of each input line (i.e.
 // "> ").
-func NewTerminal(c io.ReadWriter, prompt string) *Terminal {
-	return &Terminal{
-		Escape:     &vt100EscapeCodes,
-		c:          c,
-		prompt:     prompt,
-		termWidth:  80,
-		termHeight: 24,
-		echo:       true,
+func NewTerminal(input, output *os.File, prompt string) (*Terminal, error) {
+	var old [2]*State
+	var err error
+	if IsTerminal(int(input.Fd())) {
+		old[0], err = MakeRaw(int(input.Fd()))
+		if err != nil {
+			return nil, err
+		}
 	}
+	if IsTerminal(int(output.Fd())) {
+		old[1], err = MakeRaw(int(output.Fd()))
+		if err != nil {
+			return nil, err
+		}
+	}
+	width, height, err := GetSize(int(output.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	return &Terminal{
+		Escape:        &vt100EscapeCodes,
+		fds:           [2]uintptr{input.Fd(), output.Fd()},
+		reset:         old,
+		previousLines: make([][]byte, 0, 1),
+		c:             ReadWriter{input, output},
+		prompt:        prompt,
+		termWidth:     width,
+		termHeight:    height,
+		echo:          true,
+	}, nil
+}
+
+func (t *Terminal) Reset() error {
+	if t.reset[0] != nil {
+		if err := Restore(int(t.fds[0]), t.reset[0]); err != nil {
+			return err
+		}
+	}
+	if t.reset[1] != nil {
+		if err := Restore(int(t.fds[1]), t.reset[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 const (
@@ -448,7 +487,12 @@ func (t *Terminal) ReadLine() (line string, err error) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	return t.readLine()
+	line, err = t.readLine()
+	if err != nil {
+		return "", err
+	}
+	t.previousLines = append(t.previousLines, []byte(line))
+	return line, nil
 }
 
 func (t *Terminal) readLine() (line string, err error) {
@@ -510,6 +554,13 @@ func (t *Terminal) SetPrompt(prompt string) {
 	defer t.lock.Unlock()
 
 	t.prompt = prompt
+}
+
+func (t *Terminal) GetSize() (width, height int) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	return t.termWidth, t.termHeight
 }
 
 func (t *Terminal) SetSize(width, height int) {
