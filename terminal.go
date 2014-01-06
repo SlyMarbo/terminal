@@ -687,7 +687,7 @@ func (t *Terminal) findExes(token []byte) [][]byte {
 	if len(path) == 0 {
 		return out
 	}
-	pathdirs := strings.Split(path, ":")
+	pathdirs := filepath.SplitList(path)
 	for _, dir := range pathdirs {
 		files, err := ioutil.ReadDir(dir)
 		if err != nil {
