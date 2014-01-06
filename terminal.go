@@ -5,6 +5,7 @@
 package terminal
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -14,23 +15,25 @@ import (
 // order to achieve different styles of text.
 type EscapeCodes struct {
 	// Foreground colors
-	Black, Red, Green, Yellow, Blue, Magenta, Cyan, White []byte
+	Black, Red, Green, Yellow, Blue, Magenta, Cyan, White EscapeCode
 
 	// Reset all attributes
-	Reset []byte
+	Reset EscapeCode
 }
 
-var vt100EscapeCodes = EscapeCodes{
-	Black:   []byte{keyEscape, '[', '3', '0', 'm'},
-	Red:     []byte{keyEscape, '[', '3', '1', 'm'},
-	Green:   []byte{keyEscape, '[', '3', '2', 'm'},
-	Yellow:  []byte{keyEscape, '[', '3', '3', 'm'},
-	Blue:    []byte{keyEscape, '[', '3', '4', 'm'},
-	Magenta: []byte{keyEscape, '[', '3', '5', 'm'},
-	Cyan:    []byte{keyEscape, '[', '3', '6', 'm'},
-	White:   []byte{keyEscape, '[', '3', '7', 'm'},
+type EscapeCode []byte
 
-	Reset: []byte{keyEscape, '[', '0', 'm'},
+var vt100EscapeCodes = EscapeCodes{
+	Black:   EscapeCode{keyEscape, '[', '3', '0', 'm'},
+	Red:     EscapeCode{keyEscape, '[', '3', '1', 'm'},
+	Green:   EscapeCode{keyEscape, '[', '3', '2', 'm'},
+	Yellow:  EscapeCode{keyEscape, '[', '3', '3', 'm'},
+	Blue:    EscapeCode{keyEscape, '[', '3', '4', 'm'},
+	Magenta: EscapeCode{keyEscape, '[', '3', '5', 'm'},
+	Cyan:    EscapeCode{keyEscape, '[', '3', '6', 'm'},
+	White:   EscapeCode{keyEscape, '[', '3', '7', 'm'},
+
+	Reset: EscapeCode{keyEscape, '[', '0', 'm'},
 }
 
 // Terminal contains the state for running a VT100 terminal that is capable of
@@ -275,6 +278,23 @@ func (t *Terminal) clearLineToRight() {
 	t.queue(op)
 }
 
+func (t *Terminal) ClearLine() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.cursorX == 0 && t.cursorY == 0 {
+		// This is the easy case: there's nothing on the screen that we
+		// have to move out of the way.
+		return
+	}
+
+	// We have a prompt and possibly user input on the screen. We
+	// have to clear it first.
+	t.move(0 /* up */, 0 /* down */, t.cursorX /* left */, 0 /* right */)
+	t.cursorX = 0
+	t.clearLineToRight()
+}
+
 const maxLineLength = 4096
 
 // handleKey processes the given key and, optionally, returns a line of text
@@ -462,6 +482,43 @@ func (t *Terminal) Write(buf []byte) (n int, err error) {
 	}
 	t.outBuf = t.outBuf[:0]
 	return
+}
+
+// Print formats using the default formats for its operands
+// and writes to the terminal's output. Spaces are added
+// between operands when neither is a string. It returns the
+// number of bytes written and any write error encountered.
+func (t *Terminal) Print(a ...interface{}) (int, error) {
+	return fmt.Fprint(t, a...)
+}
+
+// Printf formats according to a format specifier and writes
+// to the terminal's output. It returns the number of bytes
+// written and any write error encountered.
+func (t *Terminal) Printf(format string, a ...interface{}) (int, error) {
+	return fmt.Fprintf(t, format, a...)
+}
+
+// Println formats using the default formats for its operands
+// and writes to the terminal's output. Spaces are always
+// added between operands and a newline is appended. It returns
+// the number of bytes written and any write error encountered.
+func (t *Terminal) Println(a ...interface{}) (int, error) {
+	return fmt.Fprintln(t, a...)
+}
+
+// SetColour sets the terminal output to the given colour, if
+// this is supported by the terminal.
+func (t *Terminal) SetColour(colour EscapeCode) error {
+	_, err := t.Write([]byte(colour))
+	return err
+}
+
+// ResetColour uses the Reset EscapeCode to reset the output
+// colour, if this is supported by the terminal.
+func (t *Terminal) ResetColour() error {
+	_, err := t.Write([]byte(t.Escape.Reset))
+	return err
 }
 
 // ReadPassword temporarily changes the prompt and reads a password, without
