@@ -5,9 +5,13 @@
 package terminal
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -50,9 +54,35 @@ type Terminal struct {
 	// may be empty if the terminal doesn't support them.
 	Escape *EscapeCodes
 
-	fds           [2]uintptr
-	reset         [2]*State
-	previousLines [][]byte
+	// By default, Terminal aims to emulate tab completion of file
+	// paths. Setting DisableFileTablCompletion will prevent this.
+	DisableFileTabCompletion bool
+
+	// By default, Terminal aims to emulate tab completion of
+	// executable files in the current $PATH. Setting
+	// DisableExeTabCompletion will prevent this.
+	DisableExeTabCompletion bool
+
+	// By default, Terminal aims to emulate command history by
+	// keeping a buffer of entered lines and handling the up
+	// and down keys accordingly. Setting DisableHistory will
+	// prevent this.
+	DisableHistory bool
+
+	// for resetting the terminal
+	fds   [2]uintptr
+	reset [2]*State
+
+	// command history
+	history        [][]byte
+	currentHistory [][]byte
+	currentIndex   int
+
+	// tab completion
+	cwd      string
+	midTab   bool
+	tabEnds  [][]byte
+	tabToken []byte
 
 	// lock protects the terminal and the state in this object from
 	// concurrent processing of a key press and a Write() call.
@@ -107,16 +137,21 @@ func NewTerminal(input, output *os.File, prompt string) (*Terminal, error) {
 	if err != nil {
 		return nil, err
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
 	return &Terminal{
-		Escape:        &vt100EscapeCodes,
-		fds:           [2]uintptr{input.Fd(), output.Fd()},
-		reset:         old,
-		previousLines: make([][]byte, 0, 1),
-		c:             ReadWriter{input, output},
-		prompt:        prompt,
-		termWidth:     width,
-		termHeight:    height,
-		echo:          true,
+		Escape:     &vt100EscapeCodes,
+		fds:        [2]uintptr{input.Fd(), output.Fd()},
+		reset:      old,
+		history:    make([][]byte, 0, 1),
+		cwd:        cwd,
+		c:          ReadWriter{input, output},
+		prompt:     prompt,
+		termWidth:  width,
+		termHeight: height,
+		echo:       true,
 	}, nil
 }
 
@@ -302,6 +337,11 @@ const maxLineLength = 4096
 func (t *Terminal) handleKey(key int) (line string, ok bool) {
 	switch key {
 	case keyBackspace:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
 		if t.pos == 0 {
 			return
 		}
@@ -316,6 +356,11 @@ func (t *Terminal) handleKey(key int) (line string, ok bool) {
 		t.queue(eraseUnderCursor)
 		t.moveCursorToPos(t.pos)
 	case keyAltLeft:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
 		// move left by a word.
 		if t.pos == 0 {
 			return
@@ -336,6 +381,11 @@ func (t *Terminal) handleKey(key int) (line string, ok bool) {
 		}
 		t.moveCursorToPos(t.pos)
 	case keyAltRight:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
 		// move right by a word.
 		for t.pos < len(t.line) {
 			if t.line[t.pos] == ' ' {
@@ -351,18 +401,107 @@ func (t *Terminal) handleKey(key int) (line string, ok bool) {
 		}
 		t.moveCursorToPos(t.pos)
 	case keyLeft:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
 		if t.pos == 0 {
 			return
 		}
 		t.pos--
 		t.moveCursorToPos(t.pos)
 	case keyRight:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
 		if t.pos == len(t.line) {
 			return
 		}
 		t.pos++
 		t.moveCursorToPos(t.pos)
+	case keyUp:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
+		if t.DisableHistory {
+			t.handleAutoComplete(key)
+			return
+		}
+		if !t.echo {
+			return
+		}
+		if t.currentHistory != nil {
+			if t.currentIndex == 0 {
+				return
+			}
+			t.currentHistory[t.currentIndex] = t.line
+			t.currentIndex--
+			newLine := t.currentHistory[t.currentIndex]
+			t.moveCursorToPos(0)
+			t.writeLine(newLine)
+			for i := len(newLine); i < len(t.line); i++ {
+				t.writeLine(space)
+			}
+			t.pos = len(newLine)
+			t.moveCursorToPos(t.pos)
+			t.line = newLine
+			return
+		}
+		t.currentHistory = make([][]byte, len(t.history)+1)
+		for i := range t.history {
+			t.currentHistory[i] = make([]byte, len(t.history[i]))
+			for j := range t.currentHistory[i] {
+				t.currentHistory[i][j] = t.history[i][j]
+			}
+		}
+		t.currentHistory[len(t.history)] = []byte{}
+		t.currentIndex = len(t.history) - 1
+		newLine := t.currentHistory[t.currentIndex]
+		t.moveCursorToPos(0)
+		t.writeLine(newLine)
+		for i := len(newLine); i < len(t.line); i++ {
+			t.writeLine(space)
+		}
+		t.pos = len(newLine)
+		t.moveCursorToPos(t.pos)
+		t.line = newLine
+		return
+	case keyDown:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
+		if t.DisableHistory {
+			t.handleAutoComplete(key)
+			return
+		}
+		if !t.echo || t.currentHistory == nil || t.currentIndex == len(t.currentHistory)-1 {
+			return
+		}
+		t.currentHistory[t.currentIndex] = t.line
+		t.currentIndex++
+		newLine := t.currentHistory[t.currentIndex]
+		t.moveCursorToPos(0)
+		t.writeLine(newLine)
+		for i := len(newLine); i < len(t.line); i++ {
+			t.writeLine(space)
+		}
+		t.pos = len(newLine)
+		t.moveCursorToPos(t.pos)
+		t.line = newLine
+		return
 	case keyEnter:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
 		t.moveCursorToPos(len(t.line))
 		t.queue([]byte("\r\n"))
 		line = string(t.line)
@@ -372,25 +511,111 @@ func (t *Terminal) handleKey(key int) (line string, ok bool) {
 		t.cursorX = 0
 		t.cursorY = 0
 		t.maxLine = 0
-	default:
-		if t.AutoCompleteCallback != nil {
-			t.lock.Unlock()
-			newLine, newPos := t.AutoCompleteCallback(t.line, t.pos, key)
-			t.lock.Lock()
-
-			if newLine != nil {
-				if t.echo {
-					t.moveCursorToPos(0)
-					t.writeLine(newLine)
-					for i := len(newLine); i < len(t.line); i++ {
-						t.writeLine(space)
-					}
-					t.moveCursorToPos(newPos)
+		t.currentIndex = 0
+		t.currentHistory = nil
+	case '\t':
+		if t.DisableExeTabCompletion && t.DisableFileTabCompletion {
+			if t.midTab {
+				t.midTab = false
+				t.tabEnds = nil
+				t.tabToken = nil
+			}
+			t.handleAutoComplete(key)
+			return
+		}
+		if t.midTab {
+			buf := new(bytes.Buffer)
+			buf.WriteString("\r\n")
+			for _, end := range t.tabEnds {
+				buf.Write(t.tabToken)
+				buf.Write(end)
+				buf.WriteString("\r\n")
+			}
+			buf.WriteString(t.prompt)
+			buf.Write(t.line)
+			t.queue(buf.Bytes())
+			return
+		}
+		// find the last full word.
+		if t.pos == 0 {
+			return
+		}
+		i := t.pos - 1
+		for i > 0 {
+			if t.line[i] == ' ' {
+				break
+			}
+			i--
+		}
+		if i == t.pos {
+			return
+		}
+		token := t.line[i:t.pos]
+		if token[0] == ' ' {
+			token = token[1:]
+		}
+		// try local files first.
+		if !t.DisableFileTabCompletion {
+			ends := t.findFiles(token)
+			switch len(ends) {
+			case 0:
+			case 1:
+				if len(t.line)+len(ends[0]) == maxLineLength {
+					return
 				}
+				newLine := make([]byte, 0, len(t.line)+len(ends[0]))
+				newLine = append(newLine, t.line[:t.pos]...)
+				newLine = append(newLine, ends[0]...)
+				newLine = append(newLine, t.line[t.pos:]...)
 				t.line = newLine
-				t.pos = newPos
+				if t.echo {
+					t.writeLine(t.line[t.pos:])
+				}
+				t.pos += len(ends[0])
+				t.moveCursorToPos(t.pos)
+				return
+			default:
+				t.midTab = true
+				t.tabEnds = ends
+				t.tabToken = token
 				return
 			}
+		}
+		// then try path executables.
+		if !t.DisableExeTabCompletion {
+			ends := t.findExes(token)
+			switch len(ends) {
+			case 0:
+			case 1:
+				if len(t.line)+len(ends[0]) == maxLineLength {
+					return
+				}
+				newLine := make([]byte, 0, len(t.line)+len(ends[0]))
+				newLine = append(newLine, t.line[:t.pos]...)
+				newLine = append(newLine, ends[0]...)
+				newLine = append(newLine, t.line[t.pos:]...)
+				t.line = newLine
+				if t.echo {
+					t.writeLine(t.line[t.pos:])
+				}
+				t.pos += len(ends[0])
+				t.moveCursorToPos(t.pos)
+			default:
+				t.midTab = true
+				t.tabEnds = ends
+				t.tabToken = token
+			}
+		}
+		return
+
+	default:
+		if t.midTab {
+			t.midTab = false
+			t.tabEnds = nil
+			t.tabToken = nil
+		}
+		if t.handleAutoComplete(key) {
+			return
 		}
 		if !isPrintable(key) {
 			return
@@ -413,6 +638,81 @@ func (t *Terminal) handleKey(key int) (line string, ok bool) {
 		t.moveCursorToPos(t.pos)
 	}
 	return
+}
+
+func (t *Terminal) handleAutoComplete(key int) bool {
+	if t.AutoCompleteCallback != nil {
+		t.lock.Unlock()
+		newLine, newPos := t.AutoCompleteCallback(t.line, t.pos, key)
+		t.lock.Lock()
+
+		if newLine != nil {
+			if t.echo {
+				t.moveCursorToPos(0)
+				t.writeLine(newLine)
+				for i := len(newLine); i < len(t.line); i++ {
+					t.writeLine(space)
+				}
+				t.moveCursorToPos(newPos)
+			}
+			t.line = newLine
+			t.pos = newPos
+			return true
+		}
+	}
+	return false
+}
+
+func (t *Terminal) findFiles(token []byte) [][]byte {
+	out := make([][]byte, 0, 1)
+	start := filepath.Join(t.cwd, string(token))
+	dir := filepath.Dir(start)
+	name := filepath.Base(start)
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), name) {
+			out = append(out, []byte(file.Name()[len(name):]))
+		}
+	}
+	return out
+}
+
+func (t *Terminal) findExes(token []byte) [][]byte {
+	out := make([][]byte, 0, 1)
+	name := filepath.Base(string(token))
+	path := os.Getenv("PATH")
+	if len(path) == 0 {
+		return out
+	}
+	pathdirs := strings.Split(path, ":")
+	for _, dir := range pathdirs {
+		files, err := ioutil.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, file := range files {
+			if file.Mode().Perm()&001 == 0 { // make sure executable
+				continue
+			}
+			if strings.HasPrefix(file.Name(), name) {
+				end := []byte(file.Name()[len(name):])
+				dup := false
+				for _, other := range out {
+					if bytes.Equal(end, other) {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					out = append(out, end)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func (t *Terminal) writeLine(line []byte) {
@@ -548,7 +848,7 @@ func (t *Terminal) ReadLine() (line string, err error) {
 	if err != nil {
 		return "", err
 	}
-	t.previousLines = append(t.previousLines, []byte(line))
+	t.history = append(t.history, []byte(line))
 	return line, nil
 }
 
