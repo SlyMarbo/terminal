@@ -314,20 +314,8 @@ func (t *Terminal) clearLineToRight() {
 }
 
 func (t *Terminal) ClearLine() {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-
-	if t.cursorX == 0 && t.cursorY == 0 {
-		// This is the easy case: there's nothing on the screen that we
-		// have to move out of the way.
-		return
-	}
-
-	// We have a prompt and possibly user input on the screen. We
-	// have to clear it first.
-	t.move(0 /* up */, 0 /* down */, t.cursorX /* left */, 0 /* right */)
-	t.cursorX = 0
-	t.clearLineToRight()
+	op := []byte{keyEscape, '[', '2', 'K'}
+	t.Write(op)
 }
 
 const maxLineLength = 4096
@@ -575,6 +563,19 @@ func (t *Terminal) handleKey(key int) (line string, ok bool) {
 				t.moveCursorToPos(t.pos)
 				return
 			default:
+				prefix := longestCommonPrefix(ends)
+				if prefix > 0 {
+					newLine := make([]byte, 0, len(t.line)+prefix)
+					newLine = append(newLine, t.line[:t.pos]...)
+					newLine = append(newLine, ends[0][:prefix]...)
+					newLine = append(newLine, t.line[t.pos:]...)
+					t.line = newLine
+					if t.echo {
+						t.writeLine(t.line[t.pos:])
+					}
+					t.pos += prefix
+					t.moveCursorToPos(t.pos)
+				}
 				t.midTab = true
 				t.tabEnds = ends
 				t.tabToken = token
@@ -601,6 +602,19 @@ func (t *Terminal) handleKey(key int) (line string, ok bool) {
 				t.pos += len(ends[0])
 				t.moveCursorToPos(t.pos)
 			default:
+				prefix := longestCommonPrefix(ends)
+				if prefix > 0 {
+					newLine := make([]byte, 0, len(t.line)+prefix)
+					newLine = append(newLine, t.line[:t.pos]...)
+					newLine = append(newLine, ends[0][:prefix]...)
+					newLine = append(newLine, t.line[t.pos:]...)
+					t.line = newLine
+					if t.echo {
+						t.writeLine(t.line[t.pos:])
+					}
+					t.pos += prefix
+					t.moveCursorToPos(t.pos)
+				}
 				t.midTab = true
 				t.tabEnds = ends
 				t.tabToken = token
@@ -713,6 +727,31 @@ func (t *Terminal) findExes(token []byte) [][]byte {
 		}
 	}
 	return out
+}
+
+func longestCommonPrefix(lines [][]byte) int {
+	switch len(lines) {
+	case 0:
+		return 0
+	case 1:
+		return len(lines[0])
+	}
+	prefix := lines[0]
+	length := len(prefix)
+	for i := 1; i < len(lines); i++ {
+		line := lines[i]
+		for j := range prefix {
+			if line[j] != prefix[j] {
+				length = j
+				if length <= 0 {
+					return 0
+				}
+				prefix = prefix[:length]
+				break
+			}
+		}
+	}
+	return length
 }
 
 func (t *Terminal) writeLine(line []byte) {
